@@ -24,7 +24,10 @@ ENABLED_EMOTION_MODELS = [
 ]
 
 # LLM Configuration
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+LLAMA_SERVER_BASE_URL = os.getenv("LLAMA_SERVER_BASE_URL", "http://localhost:8080")
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "qwen2.5-1.5b-chat-tamly-markdown-withemotion:latest")
 WHISPER_MODEL_ID = os.getenv("WHISPER_MODEL_ID", "usernone1234/whisper-vi-audio")
 WHISPER_TEMP_DIR = os.getenv("WHISPER_TEMP_DIR", "")
+
+# LLM backend selection: 'llama_cpp' uses the llama-server HTTP API
+LLM_BACKEND = os.getenv("LLM_BACKEND", "llama_cpp")

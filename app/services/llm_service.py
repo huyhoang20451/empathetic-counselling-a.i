@@ -1,46 +1,37 @@
 import json
 import re
-import uuid
 from typing import List, Dict, Tuple, Optional, AsyncIterator
 import numpy as np
 import httpx
 from fastapi import HTTPException
 
-# Import Agno và Memori
-from agno.agent import Agent
-from agno.models.openai import OpenAIChat
 from app.models.db import mem
 
-from app.config import ENABLED_EMOTION_MODELS, OLLAMA_BASE_URL, DEFAULT_LLM_MODEL
+from app.config import (
+    ENABLED_EMOTION_MODELS,
+    DEFAULT_LLM_MODEL,
+    LLM_BACKEND,
+    LLAMA_SERVER_BASE_URL,
+)
 
 class LLMService:
-    def __init__(self, base_url: str = OLLAMA_BASE_URL):
-        self.base_url = base_url
-        self.tags_url = f"{base_url}/api/tags"
+    def __init__(self, base_url: str | None = None):
+        self.base_url = (base_url or LLAMA_SERVER_BASE_URL).rstrip("/")
+        self.backend = (LLM_BACKEND or "llama_cpp").strip().lower()
         self.default_model = DEFAULT_LLM_MODEL
-        
-        # Ollama cung cấp API tương thích với OpenAI ở đuôi /v1
-        openai_base_url = f"{base_url.rstrip('/')}/v1"
-        
-        # Khởi tạo model mặc định qua giao thức OpenAI tương thích
-        self.model = OpenAIChat(
-            id=self.default_model,
-            base_url=openai_base_url,
-            api_key="ollama" # Ollama không yêu cầu key thực
-        )
-        
-        # Móc Memori vào model
-        mem.llm.register(openai_chat=self.model)
+        self.chat_completions_url = f"{self.base_url}/v1/chat/completions"
+        self.models_url = f"{self.base_url}/v1/models"
 
     async def get_available_models(self) -> List[Dict]:
-        """Lấy danh sách các model hiện có trong Ollama."""
+        """Lấy danh sách model từ llama-server HTTP API."""
         try:
-            async with httpx.AsyncClient() as client:
-                res = await client.get(self.tags_url, timeout=5.0)
-                res.raise_for_status()
-                return res.json().get("models", [])
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(self.models_url)
+                response.raise_for_status()
+                payload = response.json()
+                return payload.get("data", payload.get("models", []))
         except Exception as e:
-            print(f"Ollama connection error: {e}")
+            print(f"llama-server connection error: {e}")
             return []
 
     async def get_available_emotion_models(self) -> List[str]:
@@ -116,28 +107,62 @@ class LLMService:
 
         return emotion, advice
 
-    # ---> QUAN TRỌNG: Thêm tham số user_id và conversation_id
-    def _create_agent(self, user_id: str, model_name: Optional[str] = None) -> Agent:
-        """Hàm khởi tạo Agent chung cho cả stream và non-stream"""
-        # 1. Đặt định danh để Memori biết đang lưu ký ức cho ai
-        mem.attribution(entity_id=str(user_id), process_id="emotion_chat")
-        
-        # 2. Xử lý model nếu người dùng chọn model khác mặc định
-        current_model = self.model
-        if model_name and model_name != self.default_model:
-            openai_base_url = f"{self.base_url.rstrip('/')}/v1"
-            current_model = OpenAIChat(id=model_name, base_url=openai_base_url, api_key="ollama")
-            mem.llm.register(openai_chat=current_model)
+    def _build_messages(self, message: str) -> List[Dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": """Bạn là một chuyên gia tâm lý học AI chuyên sâu về hỗ trợ tinh thần. 
+Nhiệm vụ của bạn là nhận diện trạng thái cảm xúc từ lời tâm sự và phản hồi thấu cảm.
 
-        # 3. Khởi tạo Agent với chỉ thị trả về JSON
-        return Agent(
-            model=current_model,
-            instructions=[
-                "Bạn là một AI tư vấn tâm lý thấu cảm, tinh tế và có khả năng suy luận tốt.",
-                "Hãy sử dụng những thông tin đã biết về người dùng để đưa ra lời khuyên cá nhân hóa.",
-                "BẮT BUỘC: Bạn phải trả lời bằng MỘT chuỗi JSON hợp lệ chứa 2 key: 'Emotion' (cảm xúc hiện tại của người dùng) và 'Response' (lời khuyên của bạn)."
-            ]
-        )
+YÊU CẦU BẮT BUỘC:
+1. Luôn luôn trả về kết quả dưới định dạng JSON duy nhất. KHÔNG kèm theo lời dẫn giải ngoài JSON.
+2. Cấu trúc JSON phải chính xác như sau:
+{
+  "Emotion": "Tên cảm xúc",
+  "Response": "Nội dung phản hồi"
+}
+
+QUY TẮC NỘI DUNG:
+- Trường 'Emotion': Chỉ được chọn từ danh sách sau: [Buồn bã, Lo âu, Lạc quan, Cô đơn, Other, Vui vẻ, Chán ghét, Ngạc nhiên, Sợ hãi, Tức giận, Highly Negative, Trung lập, Hối tiếc].
+- Trường 'Response': 
+  + Sử dụng đại từ 'mình' - 'bạn'.
+  + Phải bắt đầu bằng việc gọi tên và xác nhận cảm xúc của người dùng (Validation).
+  + Không đưa ra lời khuyên sáo rỗng hoặc phán xét.
+
+VÍ DỤ ĐẦU RA:
+{
+  "Emotion": "Lo âu",
+  "Response": "Mình hiểu là bạn đang cảm thấy rất lo âu về những dự định sắp tới. Việc đối mặt với những điều chưa rõ ràng quả thực không hề dễ dàng chút nào..."
+}
+""",
+            },
+            {"role": "user", "content": message},
+        ]
+
+    async def _post_chat_completion(self, message: str, model_name: Optional[str] = None, stream: bool = False):
+        payload = {
+            "model": model_name or self.default_model,
+            "messages": self._build_messages(message),
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "stream": stream,
+        }
+        async with httpx.AsyncClient(timeout=None if stream else 60.0) as client:
+            if stream:
+                async with client.stream("POST", self.chat_completions_url, json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            data = line[6:].strip()
+                            if data == "[DONE]":
+                                break
+                            yield data
+            else:
+                response = await client.post(self.chat_completions_url, json=payload)
+                response.raise_for_status()
+                yield response.json()
 
     async def generate_response(self, message: str, user_id: Optional[str] = None, conversation_id: Optional[str] = None, model_name: Optional[str] = None, **kwargs) -> Dict:
         """Tạo phản hồi có tích hợp Memori (Non-stream)
@@ -154,13 +179,12 @@ class LLMService:
             user_id = "guest_user"
         user_id = user_id or "guest_user"
 
-        agent = self._create_agent(user_id, model_name)
         selected_model = model_name or self.default_model
 
         try:
-            # Gọi LLM (Memori tự động nhúng ký ức vào context)
-            response = agent.run(message, session_id=str(conversation_id))
-            raw_text = response.content
+            raw_text = ""
+            async for result in self._post_chat_completion(message, selected_model, stream=False):
+                raw_text = result["choices"][0]["message"]["content"]
 
             emotion, advice = self._parse_ai_response(raw_text)
 
@@ -189,21 +213,20 @@ class LLMService:
             user_id = "guest_user"
         user_id = user_id or "guest_user"
 
-        agent = self._create_agent(user_id, model_name)
         selected_model = model_name or self.default_model
         aggregated_text = ""
 
         try:
-            # Agno hỗ trợ run_stream để lấy từng chunk
-            stream_response = agent.run(message, session_id=str(conversation_id), stream=True)
-            
-            for chunk in stream_response:
-                if chunk.content:
-                    aggregated_text += chunk.content
-                    yield {
-                        "type": "chunk",
-                        "content": chunk.content,
-                    }
+            async for data in self._post_chat_completion(message, selected_model, stream=True):
+                try:
+                    payload = json.loads(data)
+                    delta = payload.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        aggregated_text += content
+                        yield {"type": "chunk", "content": content}
+                except Exception:
+                    continue
 
             emotion, advice = self._parse_ai_response(aggregated_text)
             yield {
