@@ -63,9 +63,8 @@ sequenceDiagram
     P->>PB: 3. Clean Text
     PB-->>L: 4. Return Emotional Label
     L-->>UI: 5. Empathetic Response
+```
 
----
- 
 ## 6. Getting Started
  
 > **Two ways to run this project:**
